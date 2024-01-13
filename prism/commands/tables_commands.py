@@ -163,6 +163,8 @@ def tables_create(ctx, table_name, displayname, enableforanalysis, sourcename, s
 
 
 @click.command("edit")
+@click.option("-i", "--table_id", help="Table id - overrides name from schema.")
+@click.option("-n", "--table_name", help="Table name - overrides name from schema.")
 @click.option(
     "-t",
     "--truncate",
@@ -172,19 +174,51 @@ def tables_create(ctx, table_name, displayname, enableforanalysis, sourcename, s
 )
 @click.argument("file", required=True, type=click.Path(exists=True, dir_okay=False, readable=True))
 @click.pass_context
-def tables_edit(ctx, file, truncate):
+def tables_edit(ctx, file, table_id, table_name, truncate):
     """Edit the schema for an existing table.
 
     [FILE] File containing an updated schema definition for the table.
     """
     p = ctx.obj["p"]
 
-    # The user can specify a GET:/tables output file containing
-    # the ID and other attributes that could be passed on the
-    # command line.
+    # The user must specify a file containing a Prism schema,
+    # perhaps from a tables GET operation or a CSV of column
+    # definitions.
     schema = load_schema(file=file)
 
-    table = p.tables_put(schema, truncate=truncate)
+    if schema is None:
+        logger.error("Invalid schema for edit operation - invalid file.")
+        sys.exit(1)
+
+    # If the user passed an ID or name then override the
+    # definition that may exist in the schema file.
+    if table_id is not None or table_name is not None:
+        table = p.tables_get(table_id=table_id, table_name=table_name, type="full")
+
+        if table is None:
+            logger.error("Table for ID or name not found.")
+            sys.exit(1)
+
+        # Based on the table definition, override (or set) the ID
+        # into the schema loaded from the file.
+        schema["id"] = table["id"]
+
+    # As a last sanity check, make sure we have the minimum schema
+    # definition to perform an edit operation.,
+    if "id" not in schema or "fields" not in schema:
+        logger.error("Schema does not contain ID or fields values for edit operation.")
+        sys.exit(1)
+
+    # We have the completed schema, see if the user wants to
+    # truncate existing data.  NOTE: schema changes cannot be
+    # applied if rows exist in the table.
+    if truncate:
+        # If the table cannot be truncated, error messages have
+        # already been generated, simply exit.
+        if truncate_table(p=p, table_id=schema["id"]) is None:
+            sys.exit(1)
+
+    table = p.tables_put(schema)
 
     if table is None:
         logger.error("Error updating table.")
@@ -358,8 +392,6 @@ def tables_upload(ctx, table, isname, operation, file):
     """
 
     p = ctx.obj["p"]
-
-    # Convert the file(s) provided to a list of compressed files.
 
     if len(file) == 0:
         logger.error("No files to upload.")

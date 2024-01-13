@@ -17,6 +17,7 @@ import uuid
 import gzip
 import inspect
 import copy
+import csv
 
 from urllib import parse as urlparse
 
@@ -251,6 +252,7 @@ class Prism:
         self.rest_endpoint = f"{base_url}/ccx/api/{version}/{tenant_name}"
         self.prism_endpoint = f"{base_url}/api/prismAnalytics/{version}/{tenant_name}"
         self.upload_endpoint = f"{base_url}/wday/opa/tenant/{tenant_name}/service/wBuckets"
+        self.wql_endpoint = f"{base_url}/api/wql/v1/{tenant_name}"
 
         # At creation, there cannot yet be a bearer_token obtained from Workday.
         self.bearer_token = None
@@ -1439,6 +1441,32 @@ class Prism:
 
         return results
 
+    def dataSources_list(self, wid=None, limit=100, offset=0, dataSources_name=None, search=False):
+        operation = "/dataSources"
+        logger.debug(f"dataSources_list: get {operation}")
+        url = f"{self.wql_endpoint}{operation}"
+
+        offset = 0
+        data_sources = {"total": 0, "data": []}
+
+        while True:
+            r = self.http_get(f"{url}?limit=100&offset={offset}")
+
+            if r.status_code == 200:
+                ds = r.json()
+                data_sources["data"] += ds["data"]
+            else:
+                return None
+
+            if len(ds["data"]) < 100:
+                break
+
+            offset += 100
+
+        data_sources["total"] = len(data_sources["data"])
+
+        return data_sources
+
 
 def resolve_file_list(files):
     """Evaluate file name(s)s and return the list of supported files.
@@ -1646,21 +1674,24 @@ def load_schema(p=None, file=None, source_name=None, source_id=None):
             return None
 
         # We can expect either a JSON file or a CSV file.
-        try:
-            with open(file) as json_file:
-                schema = json.load(json_file)
+        if file.lower().endswith(".csv"):
+            schema = schema_from_csv(p, file)
+        else:
+            try:
+                with open(file) as json_file:
+                    schema = json.load(json_file)
 
-            if isinstance(schema, list):
-                # Convert a list of fields into a basic schema.
-                schema["fields"] = schema
-            else:
-                # This should be a full schema, perhaps from a table list command.
-                if "name" not in schema and "fields" not in schema:
-                    logger.error("Invalid schema - name and fields attribute not found.")
-                    return None
-        except Exception as e:
-            logger.error(e)
-            return None
+                    if isinstance(schema, list):
+                        # Convert a list of fields into a basic schema.
+                        schema["fields"] = schema
+                    else:
+                        # This should be a full schema, perhaps from a table list command.
+                        if "name" not in schema and "fields" not in schema:
+                            logger.error("Invalid schema - name and fields attribute not found.")
+                            return None
+            except Exception as e:
+                logger.error(e)
+                return None
     else:
         # No file was specified, check for a Prism source table.
         if source_name is None and source_id is None:
@@ -1681,5 +1712,83 @@ def load_schema(p=None, file=None, source_name=None, source_id=None):
                 return None
 
             schema = tables["data"][0]
+
+    return schema
+
+
+def schema_from_csv(p, file):
+    """Build a Prism field list based on a CSV file."""
+
+    prism_data_types = {
+        "text": "Schema_Field_Type=Text",
+        "integer": "Schema_Field_Type=Integer",
+        "boolean": "Schema_Field_Type=Boolean",
+        "date": "Schema_Field_Type=Data",
+        "numeric": "Schema_Field_Type=Numeric",
+        "decimal": "Schema_Field_Type=Decimal",
+        "instance": "Schema_Field_Type=Instance"
+    }
+
+    # Persist all the possible data sources.
+    data_sources = None
+
+    # Start with an empy schema definition that only includes the fields attribute.
+    schema = {"fields": []}
+
+    with open(file, newline="") as csvfile:
+        reader = csv.DictReader(csvfile)
+
+        ordinal = 1
+
+        for row in reader:
+            field = {
+                "ordinal": ordinal,
+                "name": row["name"],
+                "displayName": row["displayName"] if "displayName" in row else row["name"],
+                "required": row["required"] if "required" in row else False,
+                "externalId": row["externalId"] if "externalId" in row else False,
+            }
+
+            if "type" not in row or not isinstance(row["type"], str) or len(row["type"]) == 0:
+                type_lower = "text"
+            else:
+                type_lower = row["type"].lower()
+
+                if type_lower not in prism_data_types:
+                    logger.warning("Invalid type detected {0} - default to text.".format(row["type"]))
+                    type_lower = "text"
+
+            field["type"] = {"id": prism_data_types[type_lower]}
+
+            if type_lower == "date":
+                if "parseFormat" in row:
+                    field["parseFormat"] = row["parseFormat"]
+            elif type_lower in ["numeric", "decimal"]:
+                if "precision" in row:
+                    field["precision"] = row["precision"]
+
+                if "scale" in row:
+                    field["scale"] = row["scale"]
+            elif type_lower == "instance":
+                if data_sources is None:
+                    data_sources = p.dataSources_list()
+
+                    if data_sources is None or data_sources["total"] == 0:
+                        logger.error("Error getting data sources.")
+                        return None
+
+                # Find the matching businessObject
+                bo = [
+                    ds for ds in data_sources["data"] if ds["businessObject"]["descriptor"] == row["businessObject"]
+                ]
+
+                if len(bo) == 1:
+                    field["businessObject"] = bo[0]["businessObject"]
+                else:
+                    logger.error("Business object {0} not found.".format(row["businessObject"]))
+                    return None
+
+            schema["fields"].append(field)
+            ordinal += 1
 
     return schema
